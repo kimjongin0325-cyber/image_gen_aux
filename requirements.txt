@@ -12,4 +12,4 @@ onnxruntime-gpu       # ONNX 모델의 GPU 가속 런타임 (TensorRT와 함께 
 # nvidia-tensorrt     # TensorRT 파이썬 패키지 (Colab에서 종종 별도로 설치됨)
 
 # The upscaling library
-git+https://github.com/asomoza/image_gen_aux.git
+# git+https://github.com/asomoza/image_gen_aux.git
