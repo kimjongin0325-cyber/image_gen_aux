@@ -11,7 +11,7 @@ from PIL import Image
 
 # --- Model Configuration ---
 # 사용할 단일 모델 파일 경로 정의
-SINGLE_MODEL_PATH = "content/4xDF2K_plksr_tiny_fp16_500k.onnx"
+SINGLE_MODEL_PATH = "4xDF2K_plksr_tiny_fp16_500k.onnx"
 SINGLE_MODEL_NAME = "4xDF2K_plksr_tiny_fp16_500k (4x Upscale - ONNX/TensorRT)"
 
 # --- Efficient Model Loading and Caching ---
