@@ -1,183 +1,120 @@
-import argparse
-import tempfile
-import traceback
-import cv2 
+import cv2
 import numpy as np
 from PIL import Image
-import onnxruntime as ort
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
 
-# --- Model Configuration ---
-# TensorRT 엔진 파일 경로 및 이름으로 변경 (사용자 요청 반영)
-SINGLE_MODEL_PATH = "/content/image_gen_aux/plksr_4x.engine" 
-LOADED_MODELS_CACHE = {}
+SINGLE_MODEL_PATH = "/content/image_gen_aux/plksr_4x.engine"
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
-# --- ONNX/TensorRT 세션 로딩 함수 ---
-def get_upscaler(model_path: str):
-    """
-    지정된 엔진 또는 ONNX 경로를 사용하여 ONNX InferenceSession 객체를 로드하며,
-    TensorRTExecutionProvider를 최우선으로 지정합니다.
-    """
-    if model_path not in LOADED_MODELS_CACHE:
-        print(f"Loading TensorRT/ONNX Runtime session: {model_path}")
-        
-        sess_options = ort.SessionOptions()
-        # TensorRT Execution Provider를 최우선으로 지정하여 TensorRT를 통해 가속합니다.
-        LOADED_MODELS_CACHE[model_path] = ort.InferenceSession(
-            model_path, 
-            sess_options, 
-            providers=['TensorRTExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider'] 
-        )
-    return LOADED_MODELS_CACHE[model_path]
+class PLKSRTinyEngine:
+    def __init__(self, engine_path):
+        with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        self.context = self.engine.create_execution_context()
+        self.stream = cuda.Stream()
 
+        # 텐서 이름 미리 가져오기
+        self.input_name = None
+        self.output_name = None
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE:
+                if "input" in name.lower() or self.input_name is None:
+                    self.input_name = name
+                else:
+                    self.output_name = name
 
-# --- Tiling (타일링) 처리 함수 (성능 최적화 핵심) ---
-def tiled_upscale(session, pil_image: Image.Image, tile_size: int, scale_factor: int, tile_overlap: int = 32) -> Image.Image:
-    """
-    타일링을 사용하여 PIL 이미지를 ONNX/TensorRT 모델로 업스케일링합니다.
-    GPU 메모리 부족 문제를 해결하고 고해상도 처리를 가능하게 합니다.
-    """
-    
-    # 1. 메타데이터 계산 및 결과 이미지 객체 생성
-    img_width, img_height = pil_image.size
-    output_width = img_width * scale_factor
-    output_height = img_height * scale_factor
-    output_img = Image.new('RGB', (output_width, output_height))
-    
-    input_name = session.get_inputs()[0].name
-    output_name = session.get_outputs()[0].name
+    def infer(self, img_np):
+        h, w = img_np.shape[:2]
+        h = h - (h % 4)
+        w = w - (w % 4)
+        if h <= 0 or w <= 0:
+            return np.zeros((h*4, w*4, 3), dtype=np.uint8)
+        img_np = img_np[:h, :w]
 
-    # 2. 타일 순회 및 처리
-    for i in range(0, img_height, tile_size - tile_overlap):
-        for j in range(0, img_width, tile_size - tile_overlap):
-            
-            # 입력 타일 영역 정의
-            x_start = j
-            y_start = i
-            x_end = min(j + tile_size, img_width)
-            y_end = min(i + tile_size, img_height)
+        # 입력 준비
+        x = img_np.astype(np.float32) / 255.0
+        x = np.transpose(x, (2, 0, 1))[np.newaxis, ...]  # (1,3,H,W)
 
-            input_tile = pil_image.crop((x_start, y_start, x_end, y_end))
+        # 동적 shape 설정
+        self.context.set_input_shape(self.input_name, x.shape)
 
-            # --- ONNX/TensorRT 전처리 ---
-            input_array = np.array(input_tile).astype(np.float32) / 255.0
-            input_array = np.transpose(input_array, (2, 0, 1)) # HWC -> CHW
-            input_tensor = np.expand_dims(input_array, axis=0) # CHW -> NCHW
-            
-            # --- ONNX/TensorRT 추론 실행 ---
-            ort_output = session.run([output_name], {input_name: input_tensor})[0]
+        # 입력/출력 버퍼 정확히 재할당
+        input_size = trt.volume(x.shape)
+        output_shape = (1, 3, h*4, w*4)
+        output_size = trt.volume(output_shape)
 
-            # --- ONNX/TensorRT 후처리 ---
-            output_array = np.squeeze(ort_output, axis=0)
-            output_array = np.transpose(output_array, (1, 2, 0)) # CHW -> HWC
-            output_array = np.clip(output_array * 255.0, 0, 255).astype(np.uint8)
-            output_tile_pil = Image.fromarray(output_array)
+        # 입력 버퍼
+        input_host = cuda.pagelocked_empty(input_size, np.float32)
+        input_device = cuda.mem_alloc(input_host.nbytes)
+        np.copyto(input_host, x.ravel())
 
-            # 3. 결과 타일 병합 (오버랩 제거)
-            out_tile_w, out_tile_h = output_tile_pil.size
-            
-            # 오버랩 제거 영역 계산
-            crop_top = (y_start != 0) * (tile_overlap * scale_factor // 2)
-            crop_left = (x_start != 0) * (tile_overlap * scale_factor // 2)
-            crop_bottom = (y_end != img_height) * (tile_overlap * scale_factor // 2)
-            crop_right = (x_end != img_width) * (tile_overlap * scale_factor // 2)
-            
-            final_crop_box = (
-                crop_left,
-                crop_top,
-                out_tile_w - crop_right,
-                out_tile_h - crop_bottom,
-            )
-            
-            cropped_output_tile = output_tile_pil.crop(final_crop_box)
+        # 출력 버퍼
+        output_host = cuda.pagelocked_empty(output_size, np.float32)
+        output_device = cuda.mem_alloc(output_host.nbytes)
 
-            # 결과 이미지에 최종 타일 붙여넣기 위치 계산
-            output_x = x_start * scale_factor + crop_left
-            output_y = y_start * scale_factor + crop_top
-            
-            output_img.paste(cropped_output_tile, (output_x, output_y))
+        # 바인딩 설정 (v3 필수!)
+        self.context.set_tensor_address(self.input_name, int(input_device))
+        self.context.set_tensor_address(self.output_name, int(output_device))
 
-    return output_img
+        # 실행
+        cuda.memcpy_htod_async(input_device, input_host, self.stream)
+        self.context.execute_async_v3(stream_handle=self.stream.handle)
+        cuda.memcpy_dtoh_async(output_host, output_device, self.stream)
+        self.stream.synchronize()
+
+        # 결과
+        result = output_host.reshape(output_shape)
+        result = np.clip(result[0], 0, 1).transpose(1, 2, 0)
+        return (result * 255.0).round().astype(np.uint8)
 
 
-# --- 핵심 비디오 업스케일링 함수 (루프 포함) ---
-def upscale_video(video_path, output_path):
-    print(f"\n--- 비디오 업스케일링 시작 ---")
-    print(f"입력 파일: {video_path}")
-    print(f"출력 파일: {output_path}")
+def tiled_upscale(engine, pil_img, tile_size=512, overlap=32):
+    w, h = pil_img.size
+    out = Image.new('RGB', (w*4, h*4))
+    scale = 4
 
-    try:
-        session = get_upscaler(SINGLE_MODEL_PATH)
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise FileNotFoundError(f"비디오 파일 열기 실패: {video_path}")
+    for y in range(0, h, tile_size - overlap):
+        for x in range(0, w, tile_size - overlap):
+            r = min(x + tile_size, w)
+            b = min(y + tile_size, h)
+            tile = pil_img.crop((x, y, r, b))
+            out_tile = engine.infer(np.array(tile))
+            out_pil = Image.fromarray(out_tile)
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        scale_factor = 4 
-        new_width = frame_width * scale_factor
-        new_height = frame_height * scale_factor
+            cl = (x > 0) * (overlap * scale // 2)
+            ct = (y > 0) * (overlap * scale // 2)
+            cr = (r < w) * (overlap * scale // 2)
+            cb = (b < h) * (overlap * scale // 2)
 
-        # VideoWriter 객체 초기화 (코덱: mp4v)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-        out = cv2.VideoWriter(output_path, fourcc, fps, (new_width, new_height), isColor=True)
-
-        processed_frames = 0
-        TILE_SIZE = 512 
-
-        # 비디오 프레임 루프
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            if processed_frames % 50 == 0:
-                 print(f"처리 중... 프레임 {processed_frames}/{frame_count}")
-            
-            # BGR -> RGB -> PIL (전처리)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb_frame)
-
-            # --- TensorRT 추론 실행: 타일링 함수 사용 ---
-            upscaled_pil_image = tiled_upscale(
-                session=session, 
-                pil_image=pil_image,
-                tile_size=TILE_SIZE,
-                scale_factor=scale_factor
-            )
-            # ----------------------------------------
-
-            # PIL -> NumPy -> BGR로 변환 후 VideoWriter에 쓰기 (후처리)
-            upscaled_numpy = np.array(upscaled_pil_image)
-            bgr_frame = cv2.cvtColor(upscaled_numpy, cv2.COLOR_RGB2BGR)
-            out.write(bgr_frame)
-            
-            processed_frames += 1
-
-        cap.release()
-        out.release()
-        
-        if processed_frames > 0:
-            print(f"\n--- 성공적으로 업스케일링 완료. {processed_frames} 프레임 처리 ---")
-            print(f"결과 파일: {output_path}")
-        else:
-            print(f"\n--- 업스케일링 실패: 처리된 프레임 없음 ---")
+            cropped = out_pil.crop((cl, ct, out_tile.shape[1]-cr, out_tile.shape[0]-cb))
+            out.paste(cropped, (x*scale + cl, y*scale + ct))
+    return out
 
 
-    except Exception as e:
-        print(f"\nFATAL ERROR: 비디오 처리 중 치명적인 오류 발생: {e}")
-        traceback.print_exc()
+# 실행
+engine = PLKSRTinyEngine(SINGLE_MODEL_PATH)
+cap = cv2.VideoCapture("/content/m.mp4")
+fps = cap.get(cv2.CAP_PROP_FPS)
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-# --- 메인 CLI 실행 블록 ---
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TensorRT 모델을 사용한 비디오 업스케일링 CLI 툴")
-    
-    parser.add_argument("input_file", type=str, help="업스케일할 비디오 파일 경로 (예: /content/video.mp4)")
-    parser.add_argument("--output", type=str, default="tensorrt_upscaled_output.mp4", 
-                        help="업스케일된 비디오를 저장할 경로 및 이름 (기본값: tensorrt_upscaled_output.mp4)")
+out = cv2.VideoWriter("PLKSR_LEGEND_4K.mp4", cv2.VideoWriter_fourcc(*'mp4v'), fps, (w*4, h*4))
 
-    args = parser.parse_args()
-    
-    upscale_video(args.input_file, args.output)
+i = 0
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    if i % 10 == 0:
+        print(f"프레임 처리 중... {i}")
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    up = tiled_upscale(engine, Image.fromarray(rgb))
+    bgr = cv2.cvtColor(np.array(up), cv2.COLOR_RGB2BGR)
+    out.write(bgr)
+    i += 1
+
+cap.release()
+out.release()
+print("완료!!! 한국 최초 PLKSR-tiny 실시간 4K 업스케일 영상 탄생!!!")
