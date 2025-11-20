@@ -1,0 +1,15 @@
+# Core deep learning library
+torch
+numpy                 # 이미지 및 텐서 처리에 필수
+
+# Gradio for the web interface
+gradio
+gradio-imageslider
+
+# Video and Performance
+opencv-python         # 비디오 파일을 프레임으로 분할하고 재구성
+onnxruntime-gpu       # ONNX 모델의 GPU 가속 런타임 (TensorRT와 함께 사용)
+# nvidia-tensorrt     # TensorRT 파이썬 패키지 (Colab에서 종종 별도로 설치됨)
+
+# The upscaling library
+git+https://github.com/asomoza/image_gen_aux.git

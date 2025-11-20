@@ -1,9 +1,0 @@
-# Core deep learning library
-torch
-
-# Gradio for the web interface
-gradio
-gradio-imageslider
-
-# The upscaling library
-git+https://github.com/asomoza/image_gen_aux.git
